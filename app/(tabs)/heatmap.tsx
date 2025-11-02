@@ -73,15 +73,25 @@ export default function HeatmapScreen() {
     return (
       <TouchableOpacity
         key={date}
-        style={[styles.dayBox, {
-          backgroundColor: getIntensity(count, maxEntries),
-          borderWidth: selectedDate === date ? 3 : 0,
-          borderColor: selectedDate === date ? "#2563eb" : "transparent",
-        }]}
+        style={[
+          styles.dayBox,
+          {
+            backgroundColor: getIntensity(count, maxEntries),
+            borderWidth: selectedDate === date ? 3 : 0,
+            borderColor: selectedDate === date ? "#2563eb" : "transparent",
+          },
+        ]}
         onPress={() => setSelectedDate(date)}
         activeOpacity={0.8}
       >
-        <ThemedText style={[styles.dayText, selectedDate === date && { color: "#2563eb" }]}>{new Date(date).getDate()}</ThemedText>
+        <ThemedText
+          style={[
+            styles.dayText,
+            selectedDate === date && { color: "#2563eb" },
+          ]}
+        >
+          {new Date(date).getDate()}
+        </ThemedText>
       </TouchableOpacity>
     );
   }
@@ -126,9 +136,7 @@ export default function HeatmapScreen() {
   return (
     <View style={styles.container}>
       <ThemedText style={styles.heatmapTitle}>Monthly Entries</ThemedText>
-      <View style={styles.heatmapGrid}>
-        {days.map(renderDayBox)}
-      </View>
+      <View style={styles.heatmapGrid}>{days.map(renderDayBox)}</View>
       {selectedDate && (
         <>
           <FlatList
@@ -136,7 +144,13 @@ export default function HeatmapScreen() {
             keyExtractor={(item) => item.name}
             renderItem={renderEntry}
             style={styles.entriesList}
-            ListEmptyComponent={<ThemedText style={{ textAlign: "center", color: "#888", marginTop: 12 }}>No entries for this day.</ThemedText>}
+            ListEmptyComponent={
+              <ThemedText
+                style={{ textAlign: "center", color: "#888", marginTop: 12 }}
+              >
+                No entries for this day.
+              </ThemedText>
+            }
           />
         </>
       )}

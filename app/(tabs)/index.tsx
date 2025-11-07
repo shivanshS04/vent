@@ -1,9 +1,11 @@
+// DO NOT import FormData! Use the global FormData provided by React Native/Expo.
+
 import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Audio } from "expo-av";
-import * as LegacyFileSystem from "expo-file-system/legacy";
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   FlatList,
   StyleSheet,
@@ -12,17 +14,42 @@ import {
   View,
 } from "react-native";
 
-// Use a fallback directory string for local storage
-const RECORDING_DIR = "file:///data/user/0/host.exp.exponent/files/";
+const TODAY_KEY = `notes-${new Date().toISOString().slice(0, 10)}`;
+const BASE_URL = "http://localhost:3000"; // or your cloudflare tunnel URL
 
 export default function HomeScreen() {
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [recordings, setRecordings] = useState<any[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [text, setText] = useState("");
+  const [analysis, setAnalysis] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+
+  const getTodayStart = () => {
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    return now.getTime();
+  };
+
+  // Load all entries (text and transcribed) for today
+  const loadEntries = useCallback(async () => {
+    let notesRaw = await AsyncStorage.getItem(TODAY_KEY);
+    let notes: any[] = [];
+    try {
+      notes = notesRaw ? JSON.parse(notesRaw) : [];
+      if (!Array.isArray(notes)) notes = [];
+    } catch {
+      notes = [];
+    }
+    // Sort by timestamp descending
+    notes = notes
+      .filter((n) => n.timestamp >= getTodayStart())
+      .sort((a, b) => b.timestamp - a.timestamp);
+    setRecordings(notes);
+  }, []);
 
   useEffect(() => {
-    loadRecordings();
+    loadEntries();
     return () => {
       if (recording) {
         recording.getStatusAsync().then((status) => {
@@ -32,7 +59,7 @@ export default function HomeScreen() {
         });
       }
     };
-  }, [recording]);
+  }, [recording, loadEntries]);
 
   async function startRecording() {
     try {
@@ -54,73 +81,182 @@ export default function HomeScreen() {
     }
   }
 
+  // Assuming you have access to:
+  // - recording, setRecording, setIsRecording, loadEntries (from state/props)
+  // - AsyncStorage (imported)
+  // - getDateKey (utility function for YYYY-MM-DD)
+
   async function stopRecording() {
     if (!recording) return;
+
+    // --- Define TODAY_KEY based on the date utility ---
+    const TODAY_KEY = `notes-${new Date().toISOString().slice(0, 10)}`;
+
+    // Set audio mode back to normal
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: false,
+      playsInSilentModeIOS: false,
+    });
+
     try {
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
-      if (uri) {
-        const fileName = `recording-${Date.now()}.caf`;
-        const newPath = RECORDING_DIR + fileName;
-        await LegacyFileSystem.moveAsync({ from: uri, to: newPath });
-        await saveRecordingMeta(newPath);
-        loadRecordings();
+
+      // Safety check: ensure a URI was created
+      if (!uri) {
+        throw new Error("Recording URI could not be retrieved.");
       }
-      setRecording(null);
-      setIsRecording(false);
+
+      let transcription = "";
+
+      // --- Transcription API Call ---
+      try {
+        const formData = new FormData();
+
+        // IMPORTANT: Use the M4A type, which is the default for high quality Expo recordings
+        formData.append("audio", {
+          uri,
+          name: `recording-${Date.now()}.m4a`, // Changed to .m4a
+          type: "audio/m4a", // Changed to audio/m4a or audio/mp4
+        } as any);
+
+        const response = await fetch(
+          `https://drive-panels-align-permits.trycloudflare.com/transcribe`,
+          {
+            method: "POST",
+            body: formData,
+            // Note: RN/Expo handles the 'Content-Type': 'multipart/form-data' header
+            // when you pass a FormData object, so no need to explicitly set it.
+          }
+        );
+
+        if (response.ok) {
+          const data = await response.json();
+          transcription = data.text || "";
+        } else {
+          console.error(
+            "API response not OK:",
+            response.status,
+            await response.text()
+          );
+          transcription = "Transcription failed: Server error.";
+        }
+      } catch (apiError) {
+        console.error("API Fetch Error:", apiError);
+        transcription = "Transcription failed: Network/Processing error.";
+      }
+
+      // --- Save entry in AsyncStorage ---
+      let notesRaw = await AsyncStorage.getItem(TODAY_KEY);
+      let notes: any[] = [];
+      try {
+        notes = notesRaw ? JSON.parse(notesRaw) : [];
+        if (!Array.isArray(notes)) notes = [];
+      } catch {
+        notes = [];
+      }
+
+      notes.push({
+        type: "voice",
+        uri,
+        transcription, // Save the transcription result (even if it's the error message)
+        timestamp: Date.now(),
+      });
+
+      await AsyncStorage.setItem(TODAY_KEY, JSON.stringify(notes));
+
+      // Reload entries in your HeatmapScreen to update the list
+      loadEntries();
     } catch (err) {
-      console.error("Failed to stop recording", err);
+      console.error("Failed to stop or save recording", err);
+    } finally {
+      // Ensure state is always reset, regardless of success or failure
       setRecording(null);
       setIsRecording(false);
-    }
-  }
-
-  async function saveRecordingMeta(path: string) {
-    // Optionally save metadata for recordings
-  }
-
-  async function loadRecordings() {
-    try {
-      const files = await LegacyFileSystem.readDirectoryAsync(RECORDING_DIR);
-      const entries = files
-        .filter(
-          (f: string) =>
-            f.startsWith("recording-") || f.startsWith("textentry-")
-        )
-        .map((f: string) => {
-          const match = f.match(/^(recording|textentry)-(\d+)\.(caf|txt)$/);
-          return match
-            ? {
-                uri: RECORDING_DIR + f,
-                name: f,
-                type: match[1],
-                timestamp: Number(match[2]),
-              }
-            : null;
-        })
-        .filter(Boolean)
-        .sort((a, b) => b!.timestamp - a!.timestamp);
-      setRecordings(entries);
-    } catch {
-      setRecordings([]);
     }
   }
 
   async function saveTextEntry() {
     try {
       if (!text.trim()) return;
-      const fileName = `textentry-${Date.now()}.txt`;
-      const filePath = RECORDING_DIR + fileName;
-      await LegacyFileSystem.writeAsStringAsync(filePath, text.trim());
+      let notesRaw = await AsyncStorage.getItem(TODAY_KEY);
+      let notes: any[] = [];
+      try {
+        notes = notesRaw ? JSON.parse(notesRaw) : [];
+        if (!Array.isArray(notes)) notes = [];
+      } catch {
+        notes = [];
+      }
+      notes.push({
+        type: "text",
+        text: text.trim(),
+        timestamp: Date.now(),
+      });
+      await AsyncStorage.setItem(TODAY_KEY, JSON.stringify(notes));
       setText("");
-      loadRecordings();
+      loadEntries();
     } catch (err) {
       console.error("Failed to save text entry", err);
     }
   }
 
+  async function submitNotes() {
+    try {
+      setLoading(true);
+      setAnalysis(null);
+      let notesRaw = await AsyncStorage.getItem(TODAY_KEY);
+      let notes: any[] = [];
+      try {
+        notes = notesRaw ? JSON.parse(notesRaw) : [];
+        if (!Array.isArray(notes)) notes = [];
+      } catch {
+        notes = [];
+      }
+      // Combine all text and transcribed entries
+      const entries = notes
+        .filter((n) => n.timestamp >= getTodayStart())
+        .map((n) => (n.type === "text" ? n.text : n.transcription))
+        .filter(Boolean);
+      if (!entries.length) {
+        setAnalysis({ error: "No entries for today." });
+        setLoading(false);
+        return;
+      }
+      const response = await fetch(`${BASE_URL}/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries }),
+      });
+      if (!response.ok) {
+        setAnalysis({ error: "Server error: " + response.status });
+        setLoading(false);
+        return;
+      }
+      const data = await response.json();
+      setAnalysis(data);
+      setLoading(false);
+    } catch (err: any) {
+      setAnalysis({ error: "Failed to analyze entries. " + err?.message });
+      setLoading(false);
+    }
+  }
+
+  async function removeEntry(item: any) {
+    let notesRaw = await AsyncStorage.getItem(TODAY_KEY);
+    let notes: any[] = [];
+    try {
+      notes = notesRaw ? JSON.parse(notesRaw) : [];
+      if (!Array.isArray(notes)) notes = [];
+    } catch {
+      notes = [];
+    }
+    notes = notes.filter((n: any) => n.timestamp !== item.timestamp);
+    await AsyncStorage.setItem(TODAY_KEY, JSON.stringify(notes));
+    loadEntries();
+  }
+
   function renderRecording({ item }: { item: any }) {
-    if (item.type === "textentry") {
+    if (item.type === "text") {
       return (
         <View style={styles.textEntryItem}>
           <Ionicons
@@ -133,11 +269,18 @@ export default function HomeScreen() {
             <ThemedText style={styles.textEntryName}>
               {new Date(item.timestamp).toLocaleString()}
             </ThemedText>
-            <TextEntryContent uri={item.uri} />
+            <ThemedText style={styles.textEntryContent}>{item.text}</ThemedText>
           </View>
+          <TouchableOpacity
+            onPress={() => removeEntry(item)}
+            style={styles.removeButton}
+          >
+            <Ionicons name="trash" size={20} color="#ef4444" />
+          </TouchableOpacity>
         </View>
       );
     }
+    // Voice transcription
     return (
       <View style={styles.recordingItem}>
         <View style={styles.recordingInfo}>
@@ -151,7 +294,15 @@ export default function HomeScreen() {
             {new Date(item.timestamp).toLocaleString()}
           </ThemedText>
         </View>
-        <AudioPlayer uri={item.uri} />
+        <ThemedText style={styles.textEntryContent}>
+          {item.transcription}
+        </ThemedText>
+        <TouchableOpacity
+          onPress={() => removeEntry(item)}
+          style={styles.removeButton}
+        >
+          <Ionicons name="trash" size={20} color="#ef4444" />
+        </TouchableOpacity>
       </View>
     );
   }
@@ -160,35 +311,58 @@ export default function HomeScreen() {
     <ThemedView style={styles.contentContainer}>
       <View style={styles.voiceInputContainer}>
         <TouchableOpacity
-          style={[styles.voiceButton, isRecording && styles.voiceButtonActive]}
+          style={styles.recordButtonWrapper}
           onPress={isRecording ? stopRecording : startRecording}
+          activeOpacity={0.85}
         >
-          <Ionicons
-            name={isRecording ? "stop" : "mic"}
-            size={36}
-            color="#fff"
-          />
-          <ThemedText style={styles.voiceLabel}>
+          <View
+            style={[
+              styles.recordButton,
+              isRecording && styles.recordButtonActive,
+            ]}
+          >
+            <Ionicons
+              name={isRecording ? "stop" : "mic"}
+              size={32}
+              color="#fff"
+            />
+          </View>
+          <ThemedText style={styles.recordButtonLabel}>
             {isRecording ? "Stop & Save" : "Tap to Record"}
           </ThemedText>
         </TouchableOpacity>
       </View>
-      <TextInput
-        style={styles.input}
-        placeholder="Type your thoughts..."
-        placeholderTextColor="#999"
-        multiline
-        textAlignVertical="top"
-        value={text}
-        onChangeText={setText}
-      />
-      <TouchableOpacity style={styles.submitButton} onPress={saveTextEntry}>
-        <ThemedText style={styles.submitButtonText}>Save Text Entry</ThemedText>
+      <View style={styles.inputContainer}>
+        <TextInput
+          style={styles.input}
+          placeholder="Type your thoughts..."
+          placeholderTextColor="#888"
+          multiline
+          textAlignVertical="top"
+          value={text}
+          onChangeText={setText}
+        />
+      </View>
+      <TouchableOpacity style={styles.blackButton} onPress={saveTextEntry}>
+        <ThemedText style={styles.blackButtonText}>Save Text Entry</ThemedText>
       </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.blackButton, { marginBottom: 12 }]}
+        onPress={submitNotes}
+      >
+        <ThemedText style={styles.blackButtonText}>Submit & Analyze</ThemedText>
+      </TouchableOpacity>
+      {loading && (
+        <ThemedText
+          style={{ color: "#222", textAlign: "center", marginVertical: 8 }}
+        >
+          Analyzing...
+        </ThemedText>
+      )}
       <ThemedText style={styles.sectionTitle}>Today&apos;s Entries</ThemedText>
       <FlatList
         data={recordings}
-        keyExtractor={(item) => item.name}
+        keyExtractor={(item) => String(item.timestamp) + (item.type || "")}
         renderItem={renderRecording}
         style={styles.recordingsList}
         ListEmptyComponent={
@@ -197,71 +371,47 @@ export default function HomeScreen() {
           </ThemedText>
         }
       />
+      {analysis && (
+        <View
+          style={{
+            backgroundColor: "#fff",
+            borderRadius: 16,
+            padding: 16,
+            marginVertical: 16,
+          }}
+        >
+          {analysis.error ? (
+            <ThemedText style={{ color: "red" }}>{analysis.error}</ThemedText>
+          ) : (
+            <>
+              <ThemedText style={{ fontWeight: "bold", fontSize: 18 }}>
+                Analysis
+              </ThemedText>
+              <ThemedText style={{ marginTop: 8 }}>
+                {analysis.analysis}
+              </ThemedText>
+              <ThemedText
+                style={{
+                  marginTop: 8,
+                  color: analysis.nature === "negative" ? "red" : "green",
+                }}
+              >
+                Nature: {analysis.nature}
+              </ThemedText>
+              <ThemedText style={{ marginTop: 8, color: "#888" }}>
+                {new Date(analysis.timestamp).toLocaleString()}
+              </ThemedText>
+              {analysis.transcription && (
+                <ThemedText style={{ marginTop: 8, color: "#555" }}>
+                  What you said: {analysis.transcription}
+                </ThemedText>
+              )}
+            </>
+          )}
+        </View>
+      )}
     </ThemedView>
   );
-}
-
-function AudioPlayer({ uri }: { uri: string }) {
-  const [sound, setSound] = useState<Audio.Sound | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-
-  async function playSound() {
-    if (sound) {
-      await sound.playAsync();
-      setIsPlaying(true);
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && !status.isPlaying) setIsPlaying(false);
-      });
-    } else {
-      const { sound: newSound } = await Audio.Sound.createAsync({ uri });
-      setSound(newSound);
-      await newSound.playAsync();
-      setIsPlaying(true);
-      newSound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && !status.isPlaying) setIsPlaying(false);
-      });
-    }
-  }
-
-  async function stopSound() {
-    if (sound) {
-      await sound.stopAsync();
-      setIsPlaying(false);
-    }
-  }
-
-  useEffect(() => {
-    return () => {
-      if (sound) {
-        sound.unloadAsync();
-      }
-    };
-  }, [sound]);
-
-  return (
-    <View style={styles.audioControls}>
-      <TouchableOpacity
-        onPress={isPlaying ? stopSound : playSound}
-        style={styles.audioButton}
-      >
-        <Ionicons
-          name={isPlaying ? "pause" : "play"}
-          size={24}
-          color="#3b82f6"
-        />
-      </TouchableOpacity>
-    </View>
-  );
-}
-
-function TextEntryContent({ uri }: { uri: string }) {
-  const [content, setContent] = useState("");
-  useEffect(() => {
-    LegacyFileSystem.readAsStringAsync(uri)
-      .then(setContent)
-      .catch(() => setContent("[Error loading text]"));
-  }, [uri]);
-  return <ThemedText style={styles.textEntryContent}>{content}</ThemedText>;
 }
 
 const styles = StyleSheet.create({
@@ -273,67 +423,87 @@ const styles = StyleSheet.create({
   },
   voiceInputContainer: {
     alignItems: "center",
-    marginBottom: 20,
-    padding: 16,
+    marginBottom: 24,
+    padding: 0,
+    backgroundColor: "transparent",
+    borderRadius: 0,
+    shadowColor: "transparent",
+    elevation: 0,
+  },
+  recordButtonWrapper: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+  },
+  recordButton: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    backgroundColor: "#111",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 10,
+    elevation: 5,
+    marginBottom: 6,
+    borderWidth: 3,
+    borderColor: "#222",
+    transitionDuration: "200ms",
+  },
+  recordButtonActive: {
+    backgroundColor: "#ef4444",
+    borderColor: "#ef4444",
+    shadowColor: "#ef4444",
+  },
+  recordButtonLabel: {
+    color: "#222",
+    fontSize: 16,
+    fontWeight: "600",
+    marginTop: 2,
+    letterSpacing: 0.2,
+  },
+  inputContainer: {
     backgroundColor: "#fff",
-    borderRadius: 16,
+    borderRadius: 18,
+    padding: 8,
+    marginBottom: 16,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
+    shadowOpacity: 0.1,
     shadowRadius: 8,
     elevation: 2,
-  },
-  voiceButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#3b82f6",
-    paddingVertical: 18,
-    paddingHorizontal: 32,
-    borderRadius: 32,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 8,
-    elevation: 3,
-  },
-  voiceButtonActive: {
-    backgroundColor: "#ef4444",
-  },
-  voiceLabel: {
-    color: "#fff",
-    fontSize: 20,
-    fontWeight: "700",
-    marginLeft: 16,
   },
   input: {
-    minHeight: 100,
-    borderRadius: 16,
-    padding: 18,
+    minHeight: 90,
+    borderRadius: 12,
+    padding: 16,
     fontSize: 17,
-    backgroundColor: "#fff",
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    elevation: 2,
-    marginBottom: 18,
+    backgroundColor: "#f7f7f7",
+    color: "#222",
+    borderWidth: 1.5,
+    borderColor: "#222",
+    marginBottom: 0,
+    fontWeight: "500",
   },
-  submitButton: {
-    backgroundColor: "#3b82f6",
+  blackButton: {
+    backgroundColor: "#111",
     paddingVertical: 16,
     borderRadius: 16,
     alignItems: "center",
-    marginBottom: 28,
+    marginBottom: 18,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
+    shadowOpacity: 0.1,
     shadowRadius: 8,
     elevation: 2,
   },
-  submitButtonText: {
+  blackButtonText: {
     color: "#fff",
     fontSize: 17,
     fontWeight: "600",
+    letterSpacing: 0.5,
   },
   sectionTitle: {
     fontSize: 22,
@@ -402,5 +572,13 @@ const styles = StyleSheet.create({
   textEntryContent: {
     fontSize: 16,
     color: "#222",
+  },
+  removeButton: {
+    marginLeft: 10,
+    padding: 6,
+    borderRadius: 8,
+    backgroundColor: "#fee2e2",
+    alignItems: "center",
+    justifyContent: "center",
   },
 });
